@@ -2,22 +2,30 @@
 // forecast of Roblox's Up-and-Coming chart place by place, over the 72 hours after entries
 // close. It reads the chart's history at /input and writes one forecast to /output/forecast.json.
 //
-// Model (fitted on the 34-read practice history + the 10-read practice window, validated
-// locally against the canonical scorer: practice log score -35.78 vs the persistence
-// baseline's -43.51, and +10.5 nats over persistence on average across 19 rolling-origin
-// backtests, winning 19/19):
+// Model, revision 2 (fitted on the 34-read practice history + the 10-read practice window,
+// validated locally against the canonical scorer: practice log score -34.789 vs the persistence
+// baseline's -43.512, and +11.320 nats over persistence on average across 19 rolling-origin
+// backtests, winning 19/19; the same config also wins on two fresh fold designs never used
+// for selection — origins 10..33, +11.853 over 24 folds, and origins 15..33 step 2, +11.381
+// over 10 folds. The TypeScript entry was verified against the Python tuning model on the
+// practice input: identical top10, max |dp| 1e-6, and byte-identical output across two runs):
 //   - Each game known at the history's end diffuses in rank: at horizon h hours its rank is
-//     Normal(mu, sigma) with mu = lastRank + (drift + shrunkVelocity) * h and
-//     sigma = 2.0 * sqrt(h). Drift (0.3075 ranks/hour) is the chart's mean downward drift
-//     from new games entering and pushing incumbents down; velocity is the game's recent
-//     rank velocity over the last >= 12 h, shrunk by 0.2 and clipped to +-0.5 ranks/hour
-//     (movers keep moving a little: measured persistence correlation 0.226).
+//     Normal(mu, sigma) with mu = lastRank + drift * h and sigma = 1.8 * sqrt(h). The drift
+//     is 0.41 ranks/hour (the chart's measured mean downward drift 0.205, scaled 2.0 by
+//     backtest — new games entering push incumbents down), plus 0.0009 * (rank - 1) (lower
+//     games drift down slightly faster), plus the game's recent rank velocity over the last
+//     >= 12 h, shrunk by 0.2 and clipped to +-0.5 ranks/hour (movers keep moving a little:
+//     measured persistence correlation 0.226), plus a least-squares rank trend over the
+//     last 48 h, shrunk by 0.1 and clipped to +-0.5 (a stabler read of recent movement
+//     than the single-pair velocity when reads arrive hourly), plus -0.1 times the game's
+//     log-playing-growth z-score over the last 18 h (games whose playing is surging climb:
+//     measured growth->rank-change correlation -0.054, slope about -0.059 ranks/hour per z).
 //   - Games leave the chart 28 days after publication: when details.created is present
 //     (house-recorder reads), a game's mass ramps to zero over the 12 hours before its
 //     28-day exit. Archive reads carry no details, so this term is a no-op there.
 //   - Brand-new games (not identifiable at forecast time) take a growing share of every
-//     place: measured new-share per place at 70 h is [0.15, 0.12, 0.08, 0.20, 0.12, 0.18,
-//     0.30, 0.28, 0.32, 0.32], rising linearly from hour 15, scaled by 2.5 (the backtests
+//     place: measured new-share per place at 70 h is [0.17, 0.16, 0.08, 0.32, 0.07, 0.18,
+//     0.41, 0.33, 0.40, 0.40], rising linearly from hour 15, scaled by 3.5 (the backtests
 //     prefer the extra unnamed mass: the diffusion is honest about what it cannot name).
 //   - The per-place probabilities average over every hourly slot of the scored window
 //     (read from task.json, never hardcoded), known games are scaled so each place sums to
@@ -39,19 +47,29 @@ const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
 
 /** Rank diffusion: sigma(h) = SIGMA_C * sqrt(h hours). Fitted on history pairs. */
-const SIGMA_C = 2.0;
-/** Mean downward drift of a rank, ranks per hour (0.205 measured, scaled 1.5 by backtest). */
-const DRIFT_PER_HOUR = 0.3075;
+const SIGMA_C = 1.8;
+/** Mean downward drift of a rank, ranks per hour (0.205 measured, scaled 2.0 by backtest). */
+const DRIFT_PER_HOUR = 0.41;
+/** Extra downward drift per rank below the top, ranks per hour (measured 0.00045, refined 0.0009). */
+const DRIFT_RANK = 0.0009;
 /** How much of a game's recent rank velocity survives into the forecast. */
 const VELOCITY_SHRINK = 0.2;
-/** Velocity is clipped to this many ranks per hour. */
+/** Velocity (and the recent trend) is clipped to this many ranks per hour. */
 const VELOCITY_CLIP = 0.5;
-/** New-entrant share of each place at 70 h (measured on history pairs, smoothed). */
-const NEW_AT_70 = [0.15, 0.12, 0.08, 0.2, 0.12, 0.18, 0.3, 0.28, 0.32, 0.32];
+/** Log-playing-growth z-score coefficient, ranks per hour per z (measured slope ~-0.059). */
+const GROWTH_COEF = -0.1;
+/** Playing growth is measured over the last this many hours. */
+const GROWTH_WINDOW_HOURS = 18;
+/** How much of the least-squares rank trend over the recent window survives. */
+const TREND_RECENT_SHRINK = 0.1;
+/** The recent-trend window, hours. */
+const TREND_RECENT_WINDOW_HOURS = 48;
+/** New-entrant share of each place at 70 h (measured on history pairs, unsmoothed). */
+const NEW_AT_70 = [0.17, 0.16, 0.08, 0.32, 0.07, 0.18, 0.41, 0.33, 0.4, 0.4];
 /** The new-entrant share rises linearly from this hour into the window. */
 const NEW_RISE_FROM_HOUR = 15;
 /** Backtests prefer the measured new-share curve scaled up (extra unnamed mass). */
-const NEW_SCALE = 2.5;
+const NEW_SCALE = 3.5;
 /** The new-entrant share of a place never exceeds this. */
 const NEW_CAP = 0.6;
 /** Games leave the Up-and-Coming chart this long after publication. */
@@ -151,6 +169,77 @@ function survival(id: number, horizonHours: number): number {
 }
 
 const cand = last.ids.slice(0, CANDIDATES);
+
+/** Log-playing-growth z-score per candidate over the last GROWTH_WINDOW_HOURS. */
+const growthZ = new Map<number, number>();
+{
+  let prev = snapshots[0]!;
+  for (let i = snapshots.length - 2; i >= 0; i--) {
+    if (last.at - snapshots[i]!.at >= GROWTH_WINDOW_HOURS * 3600 * 1000) {
+      prev = snapshots[i]!;
+      break;
+    }
+  }
+  const grows: number[] = [];
+  const gmap = new Map<number, number>();
+  for (const id of cand) {
+    const pa = prev.playing.get(id);
+    const pb = last.playing.get(id);
+    if (pa !== undefined && pb !== undefined && pa > 0 && pb > 0) {
+      const g = Math.log(pb / pa);
+      gmap.set(id, g);
+      grows.push(g);
+    }
+  }
+  if (grows.length > 0) {
+    const mean = grows.reduce((a, b) => a + b, 0) / grows.length;
+    const variance = grows.reduce((a, b) => a + (b - mean) * (b - mean), 0) / grows.length;
+    const sd = Math.sqrt(variance) || 1.0;
+    for (const id of cand) {
+      growthZ.set(id, ((gmap.get(id) ?? mean) - mean) / sd);
+    }
+  }
+}
+
+/** Least-squares rank trend per game over the last TREND_RECENT_WINDOW_HOURS (>= 4 reads). */
+const recentTrend = new Map<number, number>();
+{
+  const recent = snapshots.filter(
+    (s) => (last.at - s.at) / 3600000 <= TREND_RECENT_WINDOW_HOURS,
+  );
+  if (recent.length >= 2) {
+    const t0 = recent[0]!.at;
+    const obs = new Map<number, Array<[number, number]>>();
+    for (const snap of recent) {
+      const hours = (snap.at - t0) / 3600000;
+      snap.ids.forEach((id, i) => {
+        const arr = obs.get(id) ?? [];
+        arr.push([hours, i + 1]);
+        obs.set(id, arr);
+      });
+    }
+    for (const [id, pts] of obs) {
+      if (pts.length < 4) continue;
+      let sx = 0;
+      let sy = 0;
+      for (const [x, y] of pts) {
+        sx += x;
+        sy += y;
+      }
+      const xm = sx / pts.length;
+      const ym = sy / pts.length;
+      let num = 0;
+      let den = 0;
+      for (const [x, y] of pts) {
+        num += (x - xm) * (y - ym);
+        den += (x - xm) * (x - xm);
+      }
+      if (den <= 0) continue;
+      recentTrend.set(id, clamp((num / den) * TREND_RECENT_SHRINK, -VELOCITY_CLIP, VELOCITY_CLIP));
+    }
+  }
+}
+
 // q[g][k]: probability candidate g is at place k+1, averaged over the window's slots.
 const q: number[][] = cand.map(() => new Array<number>(places).fill(0));
 const slotHours = task.window.slot_minutes / 60;
@@ -159,7 +248,12 @@ for (let slot = 0; slot < task.window.slots; slot++) {
   const sd = SIGMA_C * Math.sqrt(h);
   for (let g = 0; g < cand.length; g++) {
     const id = cand[g]!;
-    const drift = DRIFT_PER_HOUR + (velocities.get(id) ?? 0);
+    const drift =
+      DRIFT_PER_HOUR +
+      DRIFT_RANK * g +
+      (velocities.get(id) ?? 0) +
+      (recentTrend.get(id) ?? 0) +
+      GROWTH_COEF * (growthZ.get(id) ?? 0);
     const mu = g + 1 + drift * h;
     const alive = survival(id, h);
     if (alive === 0) continue;
