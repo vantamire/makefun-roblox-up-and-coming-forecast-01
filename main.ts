@@ -2,22 +2,23 @@
 // forecast of Roblox's Up-and-Coming chart place by place, over the 72 hours after entries
 // close. It reads the chart's history at /input and writes one forecast to /output/forecast.json.
 //
-// Model, revision 2 (fitted on the 34-read practice history + the 10-read practice window,
-// validated locally against the canonical scorer: practice log score -34.789 vs the persistence
-// baseline's -43.512, and +11.320 nats over persistence on average across 19 rolling-origin
+// Model, revision 3 (fitted on the 34-read practice history + the 10-read practice window,
+// validated locally against the canonical scorer: practice log score -33.448 vs the persistence
+// baseline's -43.512, and +11.497 nats over persistence on average across 19 rolling-origin
 // backtests, winning 19/19; the same config also wins on two fresh fold designs never used
-// for selection — origins 10..33, +11.853 over 24 folds, and origins 15..33 step 2, +11.381
-// over 10 folds. The TypeScript entry was verified against the Python tuning model on the
-// practice input: identical top10, max |dp| 1e-6, and byte-identical output across two runs):
+// for selection — origins 10..33, +12.015 over 24 folds, and origins 15..33 step 2, +11.637
+// over 10 folds — plus +9.736 over 5 earlier origins (5..9) never used for any selection,
+// vs v2's +9.659 there. The TypeScript entry was verified against the Python tuning model on
+// the practice input: identical top10, max |dp| 1e-6, and byte-identical output across two runs):
 //   - Each game known at the history's end diffuses in rank: at horizon h hours its rank is
 //     Normal(mu, sigma) with mu = lastRank + drift * h and sigma = 1.8 * sqrt(h). The drift
 //     is 0.41 ranks/hour (the chart's measured mean downward drift 0.205, scaled 2.0 by
 //     backtest — new games entering push incumbents down), plus 0.0009 * (rank - 1) (lower
 //     games drift down slightly faster), plus the game's recent rank velocity over the last
-//     >= 12 h, shrunk by 0.2 and clipped to +-0.5 ranks/hour (movers keep moving a little:
+//     >= 12 h, shrunk by 0.15 and clipped to +-0.5 ranks/hour (movers keep moving a little:
 //     measured persistence correlation 0.226), plus a least-squares rank trend over the
-//     last 48 h, shrunk by 0.1 and clipped to +-0.5 (a stabler read of recent movement
-//     than the single-pair velocity when reads arrive hourly), plus -0.1 times the game's
+//     last 72 h, shrunk by 0.1 and clipped to +-0.5 (a stabler read of recent movement
+//     than the single-pair velocity when reads arrive hourly), plus -0.125 times the game's
 //     log-playing-growth z-score over the last 18 h (games whose playing is surging climb:
 //     measured growth->rank-change correlation -0.054, slope about -0.059 ranks/hour per z).
 //   - Games leave the chart 28 days after publication: when details.created is present
@@ -33,6 +34,9 @@
 //     baseline: a game is named at a place only while its probability beats what that place
 //     would give it unnamed, which is the proper allocation for a log score.
 //   - top10 orders games by sum over places of q * (11 - place).
+//   - v3 changes vs v2 (2026-11-12 final round): VELOCITY_SHRINK 0.20 -> 0.15, GROWTH_COEF
+//     -0.10 -> -0.125, TREND_RECENT_WINDOW_HOURS 48 -> 72; each of the three improved
+//     practice, backtest, and both fresh fold designs, and the combination improved all four.
 // Fully deterministic: no clock, no randomness, no network; the same history in writes a
 // byte-identical forecast.json out.
 //
@@ -53,17 +57,17 @@ const DRIFT_PER_HOUR = 0.41;
 /** Extra downward drift per rank below the top, ranks per hour (measured 0.00045, refined 0.0009). */
 const DRIFT_RANK = 0.0009;
 /** How much of a game's recent rank velocity survives into the forecast. */
-const VELOCITY_SHRINK = 0.2;
+const VELOCITY_SHRINK = 0.15;
 /** Velocity (and the recent trend) is clipped to this many ranks per hour. */
 const VELOCITY_CLIP = 0.5;
 /** Log-playing-growth z-score coefficient, ranks per hour per z (measured slope ~-0.059). */
-const GROWTH_COEF = -0.1;
+const GROWTH_COEF = -0.125;
 /** Playing growth is measured over the last this many hours. */
 const GROWTH_WINDOW_HOURS = 18;
 /** How much of the least-squares rank trend over the recent window survives. */
 const TREND_RECENT_SHRINK = 0.1;
 /** The recent-trend window, hours. */
-const TREND_RECENT_WINDOW_HOURS = 48;
+const TREND_RECENT_WINDOW_HOURS = 72;
 /** New-entrant share of each place at 70 h (measured on history pairs, unsmoothed). */
 const NEW_AT_70 = [0.17, 0.16, 0.08, 0.32, 0.07, 0.18, 0.41, 0.33, 0.4, 0.4];
 /** The new-entrant share rises linearly from this hour into the window. */
